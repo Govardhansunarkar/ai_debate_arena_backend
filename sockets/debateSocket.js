@@ -44,7 +44,11 @@ module.exports = (io) => {
       
       socket.emit('debate-joined', { 
         message: 'Joined debate successfully',
-        participantCount: room.participants.size
+        participantCount: room.participants.size,
+        participants: Array.from(room.participants.entries()).map(([id, info]) => ({
+          userId: id,
+          playerName: info.playerName
+        }))
       });
       
       // Notify all participants about new participant
