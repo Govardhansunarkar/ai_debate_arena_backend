@@ -7,20 +7,32 @@ require('dotenv').config();
 const app = express();
 const server = http.createServer(app);
 
+// Dynamic CORS origin function
+const corsOriginFn = (origin, callback) => {
+  const allowedOrigins = [
+    'http://localhost:5173',
+    'http://localhost:5174',
+    'http://localhost:3000',
+    'http://127.0.0.1:5173',
+    'http://127.0.0.1:5174',
+    'http://127.0.0.1:3000',
+    'https://debate-frontend-one.vercel.app',
+    process.env.FRONTEND_URL
+  ].filter(Boolean);
+  
+  // Allow all Vercel deployments
+  if (!origin || allowedOrigins.includes(origin) || origin.includes('vercel.app')) {
+    callback(null, true);
+  } else {
+    callback(null, false);
+  }
+};
+
 // Socket.IO configuration
 const io = socketIo(server, {
   transports: ['websocket', 'polling'],
   cors: {
-    origin: [
-      'http://localhost:5173',
-      'http://localhost:5174',
-      'http://localhost:3000',
-      'http://127.0.0.1:5173',
-      'http://127.0.0.1:5174',
-      'http://127.0.0.1:3000',
-      'https://*.vercel.app',  // Allow all Vercel deployments
-      process.env.FRONTEND_URL || ''  // Add your Vercel URL here
-    ],
+    origin: corsOriginFn,
     methods: ['GET', 'POST'],
     credentials: true
   },
@@ -31,17 +43,9 @@ const io = socketIo(server, {
 
 // Middleware
 app.use(cors({
-  origin: [
-    'http://localhost:5173',
-    'http://localhost:5174',
-    'http://localhost:3000',
-    'http://127.0.0.1:5173',
-    'http://127.0.0.1:5174',
-    'http://127.0.0.1:3000',
-    'https://*.vercel.app',  // Allow all Vercel deployments
-    process.env.FRONTEND_URL || ''  // Add your Vercel URL here
-  ],
-  credentials: true
+  origin: corsOriginFn,
+  credentials: true,
+  optionsSuccessStatus: 200
 }));
 app.use(express.json());
 
