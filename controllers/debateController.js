@@ -1,7 +1,115 @@
+const axios = require('axios');
 const { Debate, debates, rooms } = require('../models/index');
 const { analyzeDebateArgument } = require('../utils/debateArgumentAnalysis');
 const { buildProgressiveDebateResponse } = require('../utils/debateResponseEngine');
 const { calculateQualityBasedPoints } = require('../utils/advancedScoringSystem');
+
+// =====================================================
+// Similarity Detection - Prevent Repetitive Arguments
+// =====================================================
+const calculateSimilarity = (str1, str2) => {
+  // Simple similarity check - counts common words
+  const words1 = str1.toLowerCase().split(/\s+/);
+  const words2 = str2.toLowerCase().split(/\s+/);
+  
+  const commonWords = words1.filter(word => 
+    word.length > 4 && words2.includes(word)
+  );
+  
+  // Similarity score: 0-1 (1 = identical)
+  const maxLength = Math.max(words1.length, words2.length);
+  return commonWords.length / maxLength;
+};
+
+const isRepetitiveResponse = (response, debateHistory) => {
+  if (!debateHistory || debateHistory.length === 0) return false;
+  
+  // Check against recent arguments (last 5)
+  const recentArguments = debateHistory
+    .slice(-5)
+    .map(item => item.text || item)
+    .filter(text => text);
+  
+  for (const prevArg of recentArguments) {
+    const similarity = calculateSimilarity(response, prevArg);
+    if (similarity > 0.5) {
+      console.log(`[Repetition Check] Detected ${(similarity * 100).toFixed(0)}% similarity with previous argument`);
+      return true;
+    }
+  }
+  
+  return false;
+};
+
+// =====================================================
+// NVIDIA API Integration Function (works with Nemotron models)
+// =====================================================
+const callNvidiaAPI = async (prompt, apiKey, apiUrl, model) => {
+  try {
+    console.log('[NVIDIA] Calling API with model:', model);
+    
+    // Ensure we have the full endpoint URL
+    const endpoint = apiUrl.includes('/chat/completions') 
+      ? apiUrl 
+      : (apiUrl.replace(/\/$/, '') + '/chat/completions');
+    
+    console.log('[NVIDIA] Using endpoint:', endpoint);
+    
+    const requestBody = {
+      model: model,
+      messages: [
+        { 
+          role: 'system', 
+          content: 'You are a debate participant. Provide counter-arguments in 2-3 sentences. Be respectful but firm.'
+        },
+        { 
+          role: 'user', 
+          content: prompt 
+        }
+      ],
+      max_tokens: 1000,
+      temperature: 0.7,
+      top_p: 0.95
+    };
+    
+    const response = await axios.post(
+      endpoint,
+      requestBody,
+      {
+        headers: {
+          'Authorization': `Bearer ${apiKey}`,
+          'Content-Type': 'application/json'
+        },
+        timeout: 30000
+      }
+    );
+
+    console.log('[NVIDIA] Response status:', response.status);
+    
+    // Extract the message content from the response
+    let aiResponse = '';
+    if (response.data?.choices?.[0]?.message) {
+      // Handle different response formats
+      const message = response.data.choices[0].message;
+      aiResponse = (message.content || message.text || JSON.stringify(message)).trim();
+    }
+    
+    if (!aiResponse || aiResponse.startsWith('{')) {
+      console.error('[NVIDIA] Parsing error. Message object:', response.data?.choices?.[0]?.message);
+      throw new Error('Could not parse NVIDIA response');
+    }
+    
+    console.log('[NVIDIA] ✓ Response generated successfully');
+    return aiResponse;
+  } catch (error) {
+    console.error('[NVIDIA] ⚠ API Error:', error.message);
+    if (error.response) {
+      console.error('[NVIDIA] Status:', error.response.status);
+      console.error('[NVIDIA] Data:', error.response.data);
+    }
+    throw error;
+  }
+};
 
 // Start a debate
 exports.startDebate = (req, res) => {
@@ -156,7 +264,7 @@ exports.getAIFeedback = (req, res) => {
   }
 };
 
-// Analyze debate with OpenAI
+// Analyze debate with NVIDIA LLM (tracks debate history and provides AI feedback)
 exports.analyzeWithOpenAI = async (req, res) => {
   try {
     const { speeches, topic } = req.body;
@@ -174,75 +282,202 @@ exports.analyzeWithOpenAI = async (req, res) => {
       return res.status(400).json({ success: false, error: "Topic is required" });
     }
 
-    const openaiApiKey = process.env.OPENAI_API_KEY;
-    if (!openaiApiKey) {
-      return res.status(400).json({ 
-        success: false, 
-        error: "OpenAI API key not configured" 
-      });
-    }
+    const nvidiaApiKey = process.env.NVIDIA_API_KEY;
+    const nvidiaApiUrl = process.env.NVIDIA_API_URL || 'https://integrate.api.nvidia.com/v1';
+    const nvidiaModel = process.env.NVIDIA_MODEL || 'nvidia/nemotron-3-super-120b-a12b';
 
-    // Format speeches for analysis
+    // Filter user speeches (speaker === "user")
+    const userSpeeches = speeches.filter(s => s.speaker === 'user').map(s => s.text).join('\n\n');
+    
+    // Format all speeches with alternating speaker labels for context
     const speechText = speeches
-      .map((s, idx) => `Speech ${idx + 1}: ${s.text}`)
+      .map((s, idx) => {
+        const speaker = s.speaker === 'user' ? '👤 YOU' : '🤖 OPPONENT';
+        return `${speaker} (Speech ${idx + 1}): ${s.text}`;
+      })
       .join("\n\n");
 
-    const prompt = `
-You are an expert debate coach and speech analyst. Analyze the following debate speeches on the topic: "${topic}"
+    const feedbackPrompt = `You are a friendly debate coach helping beginner debaters improve. You explain things in simple, easy-to-understand language.
 
-SPEECHES:
+Review this debate on the topic: "${topic}"
+
+DEBATE TRANSCRIPT:
 ${speechText}
 
-Provide a detailed analysis in JSON format with the following structure:
+---
+
+Analyze THE USER'S ARGUMENTS (marked as 👤 YOU) and give feedback that a beginner can understand and use.
+
+IMPORTANT GRADING INSTRUCTIONS:
+Calculate a grade for the user based on these factors ONLY:
+- Did they explain their idea clearly? (0-2 points)
+- Did they use examples or real stories? (0-2 points)
+- Did they answer what the other person said? (0-2 points)
+- Did their arguments make sense together? (0-2 points)
+- Were they easy to understand? (0-2 points)
+
+Total score = sum of all factors (scale 1-10)
+DO NOT give everyone 7.5! Look at what they actually did.
+
+IMPORTANT: Use simple, friendly language. Avoid complex terms. Explain like you're talking to a friend!
+
+Provide feedback in this exact JSON structure:
+
 {
-  "overall_score": <1-10>,
-  "summary": "<brief overall performance summary>",
-  "strengths": [<list of specific strengths>],
-  "weaknesses": [<list of areas for improvement>],
-  "key_points": [<list of strong arguments made>],
-  "recommendations": [<list of specific recommendations>]
+  "overall_score": <CALCULATED number 1-10 based on the 5 factors above>,
+  "summary": "<1-2 simple sentences about how they did>",
+  "strengths": [
+    "<easy explanation of what was good - mention a specific thing they said>",
+    "<easy explanation of what was good - mention a specific thing they said>",
+    "<easy explanation of what was good - mention a specific thing they said>"
+  ],
+  "weaknesses": [
+    "<easy explanation of what to work on>",
+    "<easy explanation of what to work on>",
+    "<easy explanation of what to work on>"
+  ],
+  "key_points": [
+    "<their best argument in simple terms>",
+    "<another good point they made>",
+    "<another thing they said well>"
+  ],
+  "recommendations": [
+    "<simple tip they can try next time>",
+    "<simple tip they can try next time>",
+    "<simple tip they can try next time>"
+  ]
 }
 
-Be specific, constructive, and encouraging. Focus on:
-- Clarity and articulation
-- Logical reasoning
-- Evidence and examples
-- Counter-argument strength
-- Confidence and delivery
-- Time management`;
+SCORING EXAMPLES:
+- Score 9-10: Clear explanations + good examples + answered all points + arguments made sense + easy to follow
+- Score 7-8: Mostly clear + some examples + answered some points + mostly made sense + mostly easy to follow
+- Score 5-6: Somewhat clear + few examples + answered few points + some confusion + hard to follow sometimes
+- Score 3-4: Not very clear + no examples + didn't answer points + confusing logic + hard to follow
+- Score 1-2: Very unclear + no examples + ignored opponent + no logic + very hard to follow
 
-    // Call OpenAI API (simulated for demo)
-    const analysis = {
-      overall_score: 7.5,
-      summary:
-        "Strong performance with good articulation and logical reasoning. Room for improvement in counter-arguments.",
-      strengths: [
-        "Clear and articulate speech",
-        "Well-structured arguments",
-        "Good use of examples",
-      ],
-      weaknesses: [
-        "Could provide more empirical evidence",
-        "Response time to counter-arguments could be faster",
-      ],
-      key_points: [
-        "Primary argument was well-supported",
-        "Effective use of real-world examples",
-      ],
-      recommendations: [
-        "Practice counter-argument preparation",
-        "Use more recent statistics",
-        "Work on quicker response time",
-      ],
-    };
+Return ONLY valid JSON, no markdown or extra text.`;
 
-    res.json({ success: true, analysis });
+
+    try {
+      if (nvidiaApiKey) {
+        // Use NVIDIA LLM for analysis
+        console.log('[analyzeWithOpenAI] Using NVIDIA LLM for feedback analysis');
+        
+        const nvidiaResponse = await axios.post(
+          `${nvidiaApiUrl}/chat/completions`,
+          {
+            model: nvidiaModel,
+            messages: [
+              {
+                role: 'system',
+                content: `You are a friendly and encouraging debate coach. You help beginner debaters by giving simple, easy-to-understand feedback. 
+                
+You explain things clearly without using confusing terms. Your goal is to:
+1. Make the person feel good about what they did well
+2. Give them specific, easy tips to improve
+3. Use simple language that anyone can understand
+4. Be encouraging and supportive
+
+Remember: You're talking to beginners, so keep it simple and friendly!`
+              },
+              {
+                role: 'user',
+                content: feedbackPrompt
+              }
+            ],
+            max_tokens: 1500,
+            temperature: 0.7,
+            top_p: 0.95
+          },
+          {
+            headers: {
+              'Authorization': `Bearer ${nvidiaApiKey}`,
+              'Content-Type': 'application/json'
+            },
+            timeout: 30000
+          }
+        );
+
+        const analysisText = nvidiaResponse.data?.choices?.[0]?.message?.content;
+        console.log('[analyzeWithOpenAI] NVIDIA Response:', analysisText);
+
+        if (!analysisText) {
+          throw new Error('No analysis text from NVIDIA');
+        }
+
+        // Parse JSON response
+        let analysis = JSON.parse(analysisText);
+        
+        res.json({ success: true, analysis });
+      } else {
+        throw new Error('NVIDIA API key not configured');
+      }
+    } catch (llmError) {
+      console.error('[analyzeWithOpenAI] LLM Error:', llmError.message);
+      
+      // Calculate dynamic fallback grade based on debate performance
+      const userSpeeches = speeches.filter(s => s.speaker === 'user') || [];
+      const speechCount = userSpeeches.length;
+      const totalWords = userSpeeches.reduce((sum, s) => (sum + (s.text?.split(' ').length || 0)), 0);
+      const avgWordsPerSpeech = speechCount > 0 ? totalWords / speechCount : 0;
+      
+      let baseScore = 5; // Start at 5
+      
+      // Add points based on speech count (0-2 points)
+      if (speechCount >= 4) baseScore += 2;
+      else if (speechCount >= 2) baseScore += 1;
+      
+      // Add points based on speech length (0-2 points) 
+      if (avgWordsPerSpeech >= 50) baseScore += 2;
+      else if (avgWordsPerSpeech >= 25) baseScore += 1;
+      
+      // Add points based on points earned (0-2 points)
+      const totalPoints = userSpeeches.reduce((sum, s) => (sum + (s.points || 0)), 0);
+      if (totalPoints >= 30) baseScore += 2;
+      else if (totalPoints >= 15) baseScore += 1;
+      
+      // Add points for debate engagement (0-2 points)
+      if (speeches.length >= 6) baseScore += 2;
+      else if (speeches.length >= 4) baseScore += 1;
+      
+      // Cap score at 10
+      const calculatedScore = Math.min(Math.max(baseScore, 1), 10);
+      
+      // Fallback to template response if LLM fails
+      const fallbackAnalysis = {
+        overall_score: calculatedScore,
+        summary: `Good job in the debate! You had ${speechCount} turn${speechCount !== 1 ? 's' : ''} and shared your ideas. Keep practicing to get better!`,
+        strengths: [
+          "You participated in the debate and shared your thoughts",
+          "You tried to explain your ideas to the other person",
+          "You kept going and didn't give up",
+        ],
+        weaknesses: [
+          "You could add more examples from real life",
+          "You could explain your ideas a bit more",
+          "You could ask questions when the other person makes points",
+        ],
+        key_points: [
+          "You shared your main idea with the other person",
+          "You showed you were thinking about the topic",
+          "You were respectful during the debate",
+        ],
+        recommendations: [
+          "Next time, find 1-2 real examples to prove your point",
+          "Take a moment to think before you respond",
+          "Ask the other person questions about what they said",
+        ],
+      };
+      
+      res.json({ success: true, analysis: fallbackAnalysis });
+    }
   } catch (error) {
+    console.error('[analyzeWithOpenAI] Error:', error.message);
     res.status(500).json({ success: false, error: error.message });
   }
 };
 
-// Analyze debate with Gemini
+// Analyze debate with Gemini (also uses NVIDIA LLM for consistency)
 exports.analyzeWithGemini = async (req, res) => {
   try {
     const { speeches, topic } = req.body;
@@ -260,42 +495,13 @@ exports.analyzeWithGemini = async (req, res) => {
       return res.status(400).json({ success: false, error: "Topic is required" });
     }
 
-    const geminiApiKey = process.env.GEMINI_API_KEY;
-    if (!geminiApiKey) {
-      return res.json({ 
-        success: true, 
-        analysis: {
-          overall_score: 7,
-          summary: "Good debate performance. Keep practicing!",
-          strengths: ["Clear communication"],
-          weaknesses: ["Could improve evidence"],
-          recommendations: ["Practice more examples"],
-        }
-      });
-    }
-
-    // Gemini analysis (simulated for demo)
-    const analysis = {
-      overall_score: 7.8,
-      summary:
-        "Excellent performance with strong reasoning. Consider developing deeper analysis.",
-      strengths: [
-        "Compelling argumentation",
-        "Respectful tone maintained",
-        "Logical flow",
-      ],
-      weaknesses: [
-        "Limited counter-argument preparation",
-        "Could engage more with opponent",
-      ],
-      recommendations: [
-        "Study common counter-arguments",
-        "Practice active listening",
-        "Improve debate technique",
-      ],
-    };
-
-    res.json({ success: true, analysis });
+    // Since we're using NVIDIA LLM exclusively now, return success
+    // The analyzeWithOpenAI function (which uses NVIDIA) is the primary feedback engine
+    res.json({ 
+      success: true, 
+      analysis: null, // Frontend will use OpenAI analysis (which is actually NVIDIA LLM)
+      note: "Using primary LLM feedback analysis" 
+    });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
@@ -361,6 +567,10 @@ exports.getAIResponse = async (req, res) => {
     }
 
     const openaiApiKey = process.env.OPENAI_API_KEY;
+    const nvidiaApiKey = process.env.NVIDIA_API_KEY;
+    const nvidiaApiUrl = process.env.NVIDIA_API_URL || 'https://api.nvcf.nvidia.com/v2/nvcf/pureexec';
+    const nvidiaModel = process.env.NVIDIA_MODEL || 'meta-llama-3.1-405b-instruct';
+    const aiProvider = process.env.AI_PROVIDER || 'openai';
     
     // Prepare debate history for context
     const conversationHistory = (debateContext && Array.isArray(debateContext))
@@ -375,60 +585,96 @@ exports.getAIResponse = async (req, res) => {
     console.log('[getAIResponse] Argument analysis:', argumentAnalysis);
 
     let aiResponse = null;
-    let useOpenAI = false;
+    let engineUsed = 'smart-engine';
 
-    // TRY OPENAI FIRST
-    if (openaiApiKey) {
-      try {
-        const axios = require('axios');
-        useOpenAI = true;
-        
-        // Build enhanced prompt with argument analysis
-        let attackPoints = [];
-        const strengthAnalysis = argumentAnalysis.strength;
-        
-        if (!strengthAnalysis.analysis.includes("evidence-based")) {
-          attackPoints.push("- Point out the lack of empirical evidence or data to support their claim");
-        }
-        if (!strengthAnalysis.analysis.includes("logical-flow")) {
-          attackPoints.push("- Identify logical gaps or non-sequiturs in their reasoning");
-        }
-        if (strengthAnalysis.analysis.includes("short-argument")) {
-          attackPoints.push("- Demand specific, concrete examples rather than vague statements");
-        }
-        
-        const topicSpecificGuide = argumentAnalysis.topicPoints 
-          ? `\n\nTOPIC-SPECIFIC INSIGHTS:\nCommon counterpoints for this topic: ${argumentAnalysis.topicPoints.counterpoints.slice(0, 2).join(", ")}`
-          : "";
-        
-        const prompt = `You are a STRONG debate opponent in a real debate. Your goal is to WIN by attacking your opponent's weak arguments.
+    // Build enhanced prompt with argument analysis
+    let attackPoints = [];
+    const strengthAnalysis = argumentAnalysis.strength;
+    
+    if (!strengthAnalysis.analysis.includes("evidence-based")) {
+      attackPoints.push("- Point out the lack of empirical evidence or data to support their claim");
+    }
+    if (!strengthAnalysis.analysis.includes("logical-flow")) {
+      attackPoints.push("- Identify logical gaps or non-sequiturs in their reasoning");
+    }
+    if (strengthAnalysis.analysis.includes("short-argument")) {
+      attackPoints.push("- Demand specific, concrete examples rather than vague statements");
+    }
+    
+    // Extract previous arguments to avoid repetition
+    const previousArguments = (debateContext && Array.isArray(debateContext))
+      ? debateContext
+          .filter(item => item && item.text)
+          .map(item => item.text.toLowerCase())
+      : [];
+    
+    const topicSpecificGuide = argumentAnalysis.topicPoints 
+      ? `\n\nCOMMON COUNTER-ARGUMENTS FOR THIS TOPIC:\n${argumentAnalysis.topicPoints.counterpoints.slice(0, 3).join("\n")}`
+      : "";
+    
+    const prompt = `You are a PROFESSIONAL DEBATE PARTICIPANT in a STRUCTURED DEBATE.
 
 DEBATE TOPIC: "${topic}"
 
-RECENT DEBATE HISTORY:
+DEBATE HISTORY SO FAR:
 ${conversationHistory}
 
-OPPONENT JUST CLAIMED: "${userArgument}"
+YOUR OPPONENT JUST ARGUED: "${userArgument}"
 
-WEAKNESSES IN THEIR ARGUMENT TO ATTACK:
-${attackPoints.length > 0 ? attackPoints.join("\n") : "- Their argument lacks depth and doesn't address counterarguments"}
+YOUR TASK:
+You must provide a GENUINE COUNTER-ARGUMENT, not just criticism. Like a real debate, you should:
 
-YOU MUST:
-1. Attack their specific claim - don't be generic
-2. Reference what they just said - show you're engaging, not just delivering a canned response
-3. Present a counter-claim that opposes theirs
-4. Provide evidence, logic, or a real example
-5. Be AGGRESSIVE but respectful
+1. ACKNOWLEDGE their point (don't dismiss it rudely)
+2. PRESENT YOUR OPPOSITE POSITION clearly
+3. PROVIDE REAL REASONING or evidence for why their position has flaws
+4. OFFER AN ALTERNATIVE PERSPECTIVE they haven't considered
 
-Write a 2-3 sentence counter-argument that:
-- Directly contradicts their claim
-- Points out what's wrong with their logic
-- Establishes your superior position
-Be specific. If they said X, explain why X is wrong.
+CRITICAL RULES:
+- DO NOT REPEAT or paraphrase what they just said
+- DO NOT use the exact same argument they already made
+- DO NOT agree with them - present a genuine alternative view
+- DO PROVIDE CONCRETE REASONING or examples
+- BE RESPECTFUL but firm in your counter-argument
+- FOLLOW REAL DEBATE STRUCTURE (acknowledgment → counter-point → reasoning)
 
-Output ONLY the debate response, nothing else.${topicSpecificGuide}`;
+STRUCTURE YOUR RESPONSE LIKE THIS:
+1. First 1-2 words: Acknowledge their point briefly (e.g., "While you're right that...")
+2. Middle: Present your counter-perspective (e.g., "...the reality is that...")
+3. End: Provide reasoning or an alternative consideration (e.g., "...which is why...")
 
-        console.log('[getAIResponse] Calling OpenAI API');
+EXAMPLE DEBATE FLOW:
+User: "Phones distract students and reduce focus in class."
+AI: "While that's true in some cases, schools can implement usage policies instead of banning them entirely, which actually teaches digital responsibility."
+
+User: "But students will misuse them anyway."
+AI: "However, research shows that regulated access actually improves learning outcomes compared to complete bans, as students can use them for quick research."
+
+NOW GENERATE YOUR COUNTER-ARGUMENT:
+- Be genuine and thoughtful
+- Don't repeat previous arguments from the debate history
+- Provide 2-3 sentences with real reasoning
+- Sound like an intelligent debate participant, not a robot${topicSpecificGuide}
+
+Output ONLY your debate response (2-3 sentences max). No explanations.`;
+
+    // TRY PRIMARY PROVIDER (based on AI_PROVIDER setting)
+    if (aiProvider === 'nvidia' && nvidiaApiKey) {
+      try {
+        console.log('[getAIResponse] Using NVIDIA as primary provider');
+        aiResponse = await callNvidiaAPI(prompt, nvidiaApiKey, nvidiaApiUrl, nvidiaModel);
+        engineUsed = 'nvidia';
+        console.log('[getAIResponse] ✓ NVIDIA response generated:', aiResponse);
+      } catch (nvidiaError) {
+        console.error('[getAIResponse] ⚠ NVIDIA failed:', nvidiaError.message);
+        console.log('[getAIResponse] Attempting fallback to OpenAI...');
+        aiResponse = null;
+      }
+    }
+    
+    // TRY OPENAI IF PRIMARY PROVIDER UNAVAILABLE OR NOT NVIDIA
+    if (!aiResponse && openaiApiKey) {
+      try {
+        console.log('[getAIResponse] Using OpenAI as primary provider');
         
         const response = await axios.post(
           'https://api.openai.com/v1/chat/completions',
@@ -437,15 +683,15 @@ Output ONLY the debate response, nothing else.${topicSpecificGuide}`;
             messages: [
               { 
                 role: 'system', 
-                content: 'You are a cutting-edge debate opponent in a formal debate. You provide aggressive, intelligent counter-arguments that directly attack your opponent\'s claims and reference their specific statements. You never give generic responses. You build on previous debate points and systematically dismantle weak arguments.'
+                content: 'You are a professional debate participant who provides genuine counter-arguments (not repetition). Like a real debate, acknowledge valid points while presenting your opposite position with real reasoning. Never repeat arguments already made in the debate. Be respectful but firm.'
               },
               { 
                 role: 'user', 
                 content: prompt 
               }
             ],
-            max_tokens: 250,
-            temperature: 0.85
+            max_tokens: 150,
+            temperature: 0.75
           },
           {
             headers: {
@@ -457,6 +703,7 @@ Output ONLY the debate response, nothing else.${topicSpecificGuide}`;
         );
 
         aiResponse = response.data.choices[0].message.content.trim();
+        engineUsed = 'openai';
         console.log('[getAIResponse] ✓ OpenAI response generated:', aiResponse);
 
       } catch (openaiError) {
@@ -471,6 +718,14 @@ Output ONLY the debate response, nothing else.${topicSpecificGuide}`;
       console.log('[getAIResponse] Using smart debate response engine (fallback)');
       aiResponse = buildProgressiveDebateResponse(userArgument, topic, debateContext);
       console.log('[getAIResponse] ✓ Smart engine response:', aiResponse);
+    }
+
+    // CHECK IF RESPONSE IS REPETITIVE - if so, regenerate with smart engine
+    if (aiResponse && isRepetitiveResponse(aiResponse, debateContext)) {
+      console.log('[getAIResponse] ⚠ Detected repetitive response, regenerating with smart engine...');
+      aiResponse = buildProgressiveDebateResponse(userArgument, topic, debateContext);
+      engineUsed = 'smart-engine-repetition-fix';
+      console.log('[getAIResponse] ✓ New response generated:', aiResponse);
     }
 
     // Calculate points based on argument QUALITY, not length
@@ -489,7 +744,7 @@ Output ONLY the debate response, nothing else.${topicSpecificGuide}`;
       points: points,
       qualityScore: scoreResult.qualityScore,
       scoreBreakdown: scoreResult.analysis.breakdown,
-      engine: useOpenAI ? 'openai' : 'smart-engine',
+      engine: engineUsed,
       turnNumber: debateContext ? debateContext.length : 0
     });
 

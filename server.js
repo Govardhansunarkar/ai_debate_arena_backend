@@ -7,7 +7,7 @@ require('dotenv').config();
 const app = express();
 const server = http.createServer(app);
 
-// Socket.IO configuration - with explicit transports
+// Socket.IO configuration
 const io = socketIo(server, {
   transports: ['websocket', 'polling'],
   cors: {
@@ -20,11 +20,11 @@ const io = socketIo(server, {
       'http://127.0.0.1:3000'
     ],
     methods: ['GET', 'POST'],
-    credentials: true,
-    allowEIO3: true
+    credentials: true
   },
-  allowEIO3: true,
-  wsEngine: 'ws'
+  pingInterval: 10000,
+  pingTimeout: 5000,
+  upgradeTimeout: 10000
 });
 
 // Middleware
