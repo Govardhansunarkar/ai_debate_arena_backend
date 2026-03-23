@@ -1,45 +1,7 @@
 const axios = require('axios');
 const { Debate, debates, rooms } = require('../models/index');
 const { analyzeDebateArgument } = require('../utils/debateArgumentAnalysis');
-const { buildProgressiveDebateResponse } = require('../utils/debateResponseEngine');
 const { calculateQualityBasedPoints } = require('../utils/advancedScoringSystem');
-
-// =====================================================
-// Similarity Detection - Prevent Repetitive Arguments
-// =====================================================
-const calculateSimilarity = (str1, str2) => {
-  // Simple similarity check - counts common words
-  const words1 = str1.toLowerCase().split(/\s+/);
-  const words2 = str2.toLowerCase().split(/\s+/);
-  
-  const commonWords = words1.filter(word => 
-    word.length > 4 && words2.includes(word)
-  );
-  
-  // Similarity score: 0-1 (1 = identical)
-  const maxLength = Math.max(words1.length, words2.length);
-  return commonWords.length / maxLength;
-};
-
-const isRepetitiveResponse = (response, debateHistory) => {
-  if (!debateHistory || debateHistory.length === 0) return false;
-  
-  // Check against recent arguments (last 5)
-  const recentArguments = debateHistory
-    .slice(-5)
-    .map(item => item.text || item)
-    .filter(text => text);
-  
-  for (const prevArg of recentArguments) {
-    const similarity = calculateSimilarity(response, prevArg);
-    if (similarity > 0.5) {
-      console.log(`[Repetition Check] Detected ${(similarity * 100).toFixed(0)}% similarity with previous argument`);
-      return true;
-    }
-  }
-  
-  return false;
-};
 
 // =====================================================
 // NVIDIA API Integration Function (works with Nemotron models)
@@ -552,7 +514,7 @@ const generateIntelligentFallback = (userArgument, topic, debateContext) => {
   return responses[Math.floor(Math.random() * responses.length)];
 };
 
-// Get AI Response to user's argument - NOW WITH SMART DEBATE ENGINE
+// Get AI Response to user's argument - WITH STREAMING & TOPIC ENFORCEMENT
 exports.getAIResponse = async (req, res) => {
   try {
     const { userArgument, topic, debateContext } = req.body;
@@ -566,12 +528,32 @@ exports.getAIResponse = async (req, res) => {
       });
     }
 
-    const openaiApiKey = process.env.OPENAI_API_KEY;
+    // Check if user is going off-topic
+    const topicKeywords = topic.toLowerCase().split(/\s+/).filter(w => w.length > 3);
+    const userWords = userArgument.toLowerCase().split(/\s+/);
+    const topicMatches = topicKeywords.filter(kw => userWords.some(uw => uw.includes(kw))).length;
+    const topicRelevance = topicKeywords.length > 0 ? topicMatches / topicKeywords.length : 0;
+
+    // If user is off-topic (less than 30% match), redirect them
+    if (topicRelevance < 0.3 && debateContext && debateContext.length > 2) {
+      console.log('[getAIResponse] User going off-topic. Relevance:', topicRelevance);
+      const redirectResponse = `Let's stay focused on our topic: "${topic}". I appreciate your point, but can you connect it back to the main question?`;
+      
+      return res.json({
+        success: true,
+        response: redirectResponse,
+        points: 0,
+        qualityScore: 0,
+        scoreBreakdown: { 'Off-topic': 'Redirecting to main topic' },
+        engine: 'topic-enforcement',
+        isOffTopic: true
+      });
+    }
+
     const nvidiaApiKey = process.env.NVIDIA_API_KEY;
-    const nvidiaApiUrl = process.env.NVIDIA_API_URL || 'https://api.nvcf.nvidia.com/v2/nvcf/pureexec';
-    const nvidiaModel = process.env.NVIDIA_MODEL || 'meta-llama-3.1-405b-instruct';
-    const aiProvider = process.env.AI_PROVIDER || 'openai';
-    
+    const nvidiaApiUrl = process.env.NVIDIA_API_URL || 'https://integrate.api.nvidia.com/v1';
+    const nvidiaModel = process.env.NVIDIA_MODEL || 'nvidia/nemotron-3-super-120b-a12b';
+
     // Prepare debate history for context
     const conversationHistory = (debateContext && Array.isArray(debateContext))
       ? debateContext
@@ -580,163 +562,58 @@ exports.getAIResponse = async (req, res) => {
           .join("\n\n")
       : "This is the opening of the debate.";
 
-    // Analyze the user's argument for weaknesses
-    const argumentAnalysis = analyzeDebateArgument(userArgument, topic, debateContext);
-    console.log('[getAIResponse] Argument analysis:', argumentAnalysis);
-
-    let aiResponse = null;
-    let engineUsed = 'smart-engine';
-
-    // Build enhanced prompt with argument analysis
-    let attackPoints = [];
-    const strengthAnalysis = argumentAnalysis.strength;
-    
-    if (!strengthAnalysis.analysis.includes("evidence-based")) {
-      attackPoints.push("- Point out the lack of empirical evidence or data to support their claim");
-    }
-    if (!strengthAnalysis.analysis.includes("logical-flow")) {
-      attackPoints.push("- Identify logical gaps or non-sequiturs in their reasoning");
-    }
-    if (strengthAnalysis.analysis.includes("short-argument")) {
-      attackPoints.push("- Demand specific, concrete examples rather than vague statements");
-    }
-    
-    // Extract previous arguments to avoid repetition
-    const previousArguments = (debateContext && Array.isArray(debateContext))
-      ? debateContext
-          .filter(item => item && item.text)
-          .map(item => item.text.toLowerCase())
-      : [];
-    
-    const topicSpecificGuide = argumentAnalysis.topicPoints 
-      ? `\n\nCOMMON COUNTER-ARGUMENTS FOR THIS TOPIC:\n${argumentAnalysis.topicPoints.counterpoints.slice(0, 3).join("\n")}`
-      : "";
-    
-    const prompt = `You are a PROFESSIONAL DEBATE PARTICIPANT in a STRUCTURED DEBATE.
+    const prompt = `You are a debate opponent in a simple, friendly debate.
 
 DEBATE TOPIC: "${topic}"
 
-DEBATE HISTORY SO FAR:
+DEBATE HISTORY:
 ${conversationHistory}
 
-YOUR OPPONENT JUST ARGUED: "${userArgument}"
+THE USER JUST SAID: "${userArgument}"
 
-YOUR TASK:
-You must provide a GENUINE COUNTER-ARGUMENT, not just criticism. Like a real debate, you should:
+Your task: Give a SHORT, friendly counter-argument (2-3 sentences MAX).
 
-1. ACKNOWLEDGE their point (don't dismiss it rudely)
-2. PRESENT YOUR OPPOSITE POSITION clearly
-3. PROVIDE REAL REASONING or evidence for why their position has flaws
-4. OFFER AN ALTERNATIVE PERSPECTIVE they haven't considered
+RULES:
+1. Keep it SHORT and SIMPLE - anyone can understand
+2. Use everyday words, not fancy language
+3. Acknowledge their point, then give your opposite view
+4. Add ONE simple reason why your view is better
+5. Sound natural, like talking to a friend
+6. Stay on the topic: "${topic}"
 
-CRITICAL RULES:
-- DO NOT REPEAT or paraphrase what they just said
-- DO NOT use the exact same argument they already made
-- DO NOT agree with them - present a genuine alternative view
-- DO PROVIDE CONCRETE REASONING or examples
-- BE RESPECTFUL but firm in your counter-argument
-- FOLLOW REAL DEBATE STRUCTURE (acknowledgment → counter-point → reasoning)
+EXAMPLE:
+User: "Remote work helps people focus more."
+Response: "I see why you'd think that, but I disagree. Working from home has lots of distractions like family, pets, and chores. Plus, teams work better together in one place."
 
-STRUCTURE YOUR RESPONSE LIKE THIS:
-1. First 1-2 words: Acknowledge their point briefly (e.g., "While you're right that...")
-2. Middle: Present your counter-perspective (e.g., "...the reality is that...")
-3. End: Provide reasoning or an alternative consideration (e.g., "...which is why...")
+Now give YOUR response (2-3 sentences only, no more):`;
 
-EXAMPLE DEBATE FLOW:
-User: "Phones distract students and reduce focus in class."
-AI: "While that's true in some cases, schools can implement usage policies instead of banning them entirely, which actually teaches digital responsibility."
-
-User: "But students will misuse them anyway."
-AI: "However, research shows that regulated access actually improves learning outcomes compared to complete bans, as students can use them for quick research."
-
-NOW GENERATE YOUR COUNTER-ARGUMENT:
-- Be genuine and thoughtful
-- Don't repeat previous arguments from the debate history
-- Provide 2-3 sentences with real reasoning
-- Sound like an intelligent debate participant, not a robot${topicSpecificGuide}
-
-Output ONLY your debate response (2-3 sentences max). No explanations.`;
-
-    // TRY PRIMARY PROVIDER (based on AI_PROVIDER setting)
-    if (aiProvider === 'nvidia' && nvidiaApiKey) {
-      try {
-        console.log('[getAIResponse] Using NVIDIA as primary provider');
-        aiResponse = await callNvidiaAPI(prompt, nvidiaApiKey, nvidiaApiUrl, nvidiaModel);
-        engineUsed = 'nvidia';
-        console.log('[getAIResponse] ✓ NVIDIA response generated:', aiResponse);
-      } catch (nvidiaError) {
-        console.error('[getAIResponse] ⚠ NVIDIA failed:', nvidiaError.message);
-        console.log('[getAIResponse] Attempting fallback to OpenAI...');
-        aiResponse = null;
-      }
-    }
-    
-    // TRY OPENAI IF PRIMARY PROVIDER UNAVAILABLE OR NOT NVIDIA
-    if (!aiResponse && openaiApiKey) {
-      try {
-        console.log('[getAIResponse] Using OpenAI as primary provider');
-        
-        const response = await axios.post(
-          'https://api.openai.com/v1/chat/completions',
-          {
-            model: 'gpt-3.5-turbo',
-            messages: [
-              { 
-                role: 'system', 
-                content: 'You are a professional debate participant who provides genuine counter-arguments (not repetition). Like a real debate, acknowledge valid points while presenting your opposite position with real reasoning. Never repeat arguments already made in the debate. Be respectful but firm.'
-              },
-              { 
-                role: 'user', 
-                content: prompt 
-              }
-            ],
-            max_tokens: 120,  // Reduced from 150 for faster generation
-            temperature: 0.70  // Optimized
-          },
-          {
-            headers: {
-              'Authorization': `Bearer ${openaiApiKey}`,
-              'Content-Type': 'application/json'
-            },
-            timeout: 8000  // Reduced from 10000 to 8 seconds
-          }
-        );
-
-        aiResponse = response.data.choices[0].message.content.trim();
-        engineUsed = 'openai';
-        console.log('[getAIResponse] ✓ OpenAI response generated:', aiResponse);
-
-      } catch (openaiError) {
-        console.error('[getAIResponse] ⚠ OpenAI failed:', openaiError.message);
-        console.log('[getAIResponse] Falling back to smart debate engine...');
-        aiResponse = null;
-      }
+    let aiResponse = null;
+    let engineUsed = 'nvidia';
+    try {
+      console.log('[getAIResponse] Calling NVIDIA for response');
+      aiResponse = await callNvidiaAPI(prompt, nvidiaApiKey, nvidiaApiUrl, nvidiaModel);
+      console.log('[getAIResponse] ✓ NVIDIA response received:', aiResponse.substring(0, 100));
+    } catch (nvidiaError) {
+      console.error('[getAIResponse] NVIDIA failed:', nvidiaError.message);
+      
+      // Fallback to simple smart response if API fails
+      engineUsed = 'smart-fallback';
+      const counterarguments = [
+        `I understand your point, but I disagree. While what you said sounds right, the real issue is different. Most people miss the fact that there are other important reasons to consider.`,
+        `You make a fair point, but let me explain why I think differently. The thing you're not seeing is that in real life, things work in another way.`,
+        `That's interesting, but here's my opinion: what you said doesn't show the full picture of "${topic.toLowerCase()}". Let me tell you why it matters.`,
+        `I see what you mean, but I think you're missing something important. The real problem is that your view only looks at one side of the story.`,
+        `You're right about some things, but consider this: there's a bigger picture here that changes everything about how we should think about this topic.`
+      ];
+      
+      aiResponse = counterarguments[Math.floor(Math.random() * counterarguments.length)];
     }
 
-    // IF NO OPENAI RESPONSE OR NO API KEY, USE SMART DEBATE ENGINE
-    if (!aiResponse) {
-      console.log('[getAIResponse] Using smart debate response engine (fallback)');
-      aiResponse = buildProgressiveDebateResponse(userArgument, topic, debateContext);
-      console.log('[getAIResponse] ✓ Smart engine response:', aiResponse);
-    }
-
-    // CHECK IF RESPONSE IS REPETITIVE - if so, regenerate with smart engine
-    if (aiResponse && isRepetitiveResponse(aiResponse, debateContext)) {
-      console.log('[getAIResponse] ⚠ Detected repetitive response, regenerating with smart engine...');
-      aiResponse = buildProgressiveDebateResponse(userArgument, topic, debateContext);
-      engineUsed = 'smart-engine-repetition-fix';
-      console.log('[getAIResponse] ✓ New response generated:', aiResponse);
-    }
-
-    // Calculate points based on argument QUALITY, not length
+    // Calculate points based on argument QUALITY
     const scoreResult = calculateQualityBasedPoints(userArgument);
     const points = scoreResult.points;
     
-    console.log('[getAIResponse] ✓ Quality-based scoring:', {
-      qualityScore: scoreResult.qualityScore,
-      points: points,
-      analysis: scoreResult.analysis.breakdown
-    });
+    console.log('[getAIResponse] ✓ Response ready and sent');
 
     res.json({
       success: true,
@@ -751,13 +628,13 @@ Output ONLY your debate response (2-3 sentences max). No explanations.`;
   } catch (error) {
     console.error('[getAIResponse] Error:', error);
     
-    // FINAL FALLBACK - emergency response
-    const emergencyResponse = `That's an interesting perspective, but I have to respectfully disagree with your argument about "${userArgument.substring(0, 50)}..." because the evidence suggests something quite different.`;
+    // Simple emergency response
+    const emergencyResponse = `I see your point, but I think differently about "${topic}". Let me explain why my view makes more sense.`;
     
     res.json({
       success: true,
       response: emergencyResponse,
-      points: 8,
+      points: 5,
       engine: 'emergency-fallback'
     });
   }
