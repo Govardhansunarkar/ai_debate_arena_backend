@@ -67,9 +67,9 @@ const callNvidiaAPI = async (prompt, apiKey, apiUrl, model) => {
           content: prompt 
         }
       ],
-      max_tokens: 1000,
-      temperature: 0.7,
-      top_p: 0.95
+      max_tokens: 800,  // Reduced from 1000
+      temperature: 0.65,  // Reduced from 0.7 for faster generation
+      top_p: 0.90  // Reduced from 0.95
     };
     
     const response = await axios.post(
@@ -80,7 +80,7 @@ const callNvidiaAPI = async (prompt, apiKey, apiUrl, model) => {
           'Authorization': `Bearer ${apiKey}`,
           'Content-Type': 'application/json'
         },
-        timeout: 30000
+        timeout: 12000  // Reduced from 30000 to 12 seconds
       }
     );
 
@@ -690,15 +690,15 @@ Output ONLY your debate response (2-3 sentences max). No explanations.`;
                 content: prompt 
               }
             ],
-            max_tokens: 150,
-            temperature: 0.75
+            max_tokens: 120,  // Reduced from 150 for faster generation
+            temperature: 0.70  // Optimized
           },
           {
             headers: {
               'Authorization': `Bearer ${openaiApiKey}`,
               'Content-Type': 'application/json'
             },
-            timeout: 10000
+            timeout: 8000  // Reduced from 10000 to 8 seconds
           }
         );
 
